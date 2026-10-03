@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Secure Access Gateway</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<style>
+    * { box-sizing: border-box; }
+    body, html { margin: 0; width: 100%; height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; background: #05070d; color: #e8ecf5; overflow: hidden; }
+
+    #lock-screen {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        background: radial-gradient(circle at 50% 30%, #3a0d14, #0b0508 70%);
+        transition: opacity .5s ease, background .5s ease; padding: 20px; text-align: center;
+    }
+    #lock-screen.granted { background: radial-gradient(circle at 50% 30%, #0b3a1f, #040b07 70%); }
+    #lock-screen.denied  { animation: shake .4s; }
+    @keyframes shake { 25% { transform: translateX(-10px);} 75% { transform: translateX(10px);} }
+
+    .icon { font-size: 54px; margin-bottom: 6px; filter: drop-shadow(0 0 18px rgba(255,82,82,.7)); }
+    .granted .icon { filter: drop-shadow(0 0 18px rgba(0,230,118,.8)); }
+    h1 { margin: 0 0 6px; font-size: 2.2rem; letter-spacing: 4px; text-transform: uppercase; color: #ff5252; text-shadow: 0 0 20px rgba(255,82,82,.5); }
+    .granted h1 { color: #00e676; text-shadow: 0 0 20px rgba(0,230,118,.5); }
+    p.sub { margin: 0 0 24px; color: #9aa3bd; }
+
+    .stage {
+        position: relative; width: 320px; height: 240px; border-radius: 16px; overflow: hidden;
+        border: 2px solid rgba(255,255,255,.2); background: #000; margin-bottom: 22px; display: none;
+        box-shadow: 0 0 30px rgba(255,82,82,.25);
+    }
+    .granted .stage { box-shadow: 0 0 30px rgba(0,230,118,.4); border-color: #00e676; }
+    .stage.show { display: block; }
+    video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+    .scanline {
+        position: absolute; left: 0; right: 0; height: 3px; opacity: 0;
+        background: linear-gradient(90deg, transparent, #00e5ff, transparent); box-shadow: 0 0 16px #00e5ff;
+    }
+    .scanning .scanline { opacity: 1; animation: sweep 1.1s ease-in-out infinite alternate; }
+    @keyframes sweep { from { top: 4%; } to { top: 96%; } }
+
+    .scan-btn {
+        padding: 15px 44px; font-size: 1.1rem; font-weight: 700; color: #fff; border: 0; border-radius: 40px; cursor: pointer;
+        background: linear-gradient(90deg, #ff5252, #ff1744); box-shadow: 0 8px 28px rgba(255,23,68,.45); transition: .2s;
+    }
+    .scan-btn:hover:not(:disabled) { transform: translateY(-2px) scale(1.04); }
+    .scan-btn:disabled { opacity: .45; cursor: not-allowed; filter: grayscale(.6); }
+    #scan-status { margin-top: 18px; min-height: 22px; font-size: 1rem; color: #aab3cf; max-width: 420px; }
+
+    #app-frame {
+        position: fixed; inset: 0; width: 100%; height: 100%;
+        border: 0; background: #fff; display: none;
+    }
+</style>
+</head>
+<body>
+
+<iframe id="app-frame" title="Protected App"
+        sandbox="allow-forms allow-modals allow-popups allow-scripts allow-same-origin"></iframe>
+
+<div id="lock-screen">
+    <div class="icon" id="lockIcon">🔒</div>
+    <h1 id="lockTitle">Access Blocked</h1>
+    <p class="sub">Identity verification required to proceed</p>
+
+    <div class="stage" id="stage">
+        <video id="webcam" autoplay muted playsinline></video>
+        <div class="scanline"></div>
+    </div>
+
+    <button class="scan-btn" id="btnScan" disabled>Loading...</button>
+    <div id="scan-status">Checking saved session...</div>
+</div>
+
+<script>
+const SUPABASE_URL = "https://uwpcgccammspgzocjsco.supabase.co";
+const SUPABASE_KEY = "sb_publishable_VovyqA7vY-IVd2qke-sCRg_l1LdpMMV";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const APP_URL = "https://raw.githubusercontent.com/TheCoder-creator/Minecraft3/refs/heads/main/index.html";
+
+const lockScreen = document.getElementById('lock-screen');
+const appFrame = document.getElementById('app-frame');
+const stage = document.getElementById('stage');
+const video = document.getElementById('webcam');
+const btnScan = document.getElementById('btnScan');
+const statusDiv = document.getElementById('scan-status');
+
+const detOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 });
+
+// ---- Strictness settings ----
+const MATCH_THRESHOLD = 0.45;  // lower = stricter. If real users get rejected, try 0.5
+const FRAMES_REQUIRED = 5;     // every frame must match the same person
+const MIN_MARGIN = 0.06;       // best match must beat the next-closest person by this much
+const MIN_SCORE = 0.5;         // detection confidence required per frame
+const CAPTURE_TIME_LIMIT = 10000;
+// -----------------------------
+
+// ---- Remember-me settings ----
+const REMEMBER_LOGINS = 5;     // visits that skip the face scan after a successful scan
+const MAX_AGE_DAYS = 7;        // saved session also expires after this many days
+const SESSION_KEY = "gateway.session";
+// ------------------------------
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let modelsReady = false;
+let cameraReady = false;
+
+/* =========================================================
+   REMEMBERED SESSION (localStorage)
+   ========================================================= */
+
+function readSession() {
+    try {
+        const s = JSON.parse(localStorage.getItem(SESSION_KEY));
+        if (!s || typeof s.name !== 'string' || typeof s.remaining !== 'number') return null;
+        if (s.remaining <= 0) return null;
+        if (Date.now() - s.createdAt > MAX_AGE_DAYS * 86400000) return null;
+        return s;
+    } catch { return null; }
+}
+
+function writeSession(session) {
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch (e) { console.warn("Could not save session", e); }
+}
+
+function clearSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+function saveNewSession(name) {
+    writeSession({ name, remaining: REMEMBER_LOGINS, createdAt: Date.now() });
+}
+
+// Uses up one remembered login; returns how many are left afterwards
+function consumeRememberedLogin(session) {
+    const left = session.remaining - 1;
+    if (left <= 0) clearSession();
+    else writeSession({ ...session, remaining: left });
+    return left;
+}
+
+/* =========================================================
+   FACE SCAN FLOW
+   ========================================================= */
+
+function updateButton() {
+    if (modelsReady && cameraReady) {
+        statusDiv.innerText = "System armed. Ready to scan.";
+        btnScan.innerText = "Face ID Scan";
+        btnScan.disabled = false;
+    }
+}
+
+async function loadModels() {
+    try {
+        const URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+        await Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri(URL),
+            faceapi.nets.faceLandmark68Net.loadFromUri(URL),
+            faceapi.nets.faceRecognitionNet.loadFromUri(URL)
+        ]);
+        modelsReady = true;
+        updateButton();
+    } catch (e) { statusDiv.innerText = "Model load failed: " + e.message; }
+}
+
+async function startCamera() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+        });
+        video.srcObject = stream;
+        stage.classList.add('show');
+        await new Promise(res => video.addEventListener('playing', res, { once: true }));
+        cameraReady = true;
+        updateButton();
+    } catch (e) {
+        statusDiv.innerText = "Camera error: " + e.message + " (needs https or localhost)";
+    }
+}
+
+function startScanFlow(message) {
+    if (message) statusDiv.innerText = message;
+    loadModels();
+    startCamera();
+}
+
+async function collectFrames() {
+    const frames = [];
+    const deadline = Date.now() + CAPTURE_TIME_LIMIT;
+    while (frames.length < FRAMES_REQUIRED && Date.now() < deadline) {
+        const d = await faceapi.detectSingleFace(video, detOpts).withFaceLandmarks().withFaceDescriptor();
+        if (d && d.detection.score >= MIN_SCORE) { frames.push(d.descriptor); await sleep(150); }
+        else await sleep(50);
+    }
+    return frames;
+}
+
+function toDescriptors(emb) {
+    if (!emb || !emb.length) return [];
+    return (Array.isArray(emb[0]) ? emb : [emb]).map(a => new Float32Array(a));
+}
+
+function buildPeople(rows) {
+    const people = new Map();
+    for (const row of rows) {
+        const key = row.name.trim().toLowerCase();
+        if (!people.has(key)) people.set(key, { name: row.name, descriptors: [] });
+        people.get(key).descriptors.push(...toDescriptors(row.face_embedding));
+    }
+    return [...people.values()];
+}
+
+function rankPeople(descriptor, people) {
+    return people
+        .map(p => ({ name: p.name, dist: Math.min(...p.descriptors.map(d => faceapi.euclideanDistance(descriptor, d))) }))
+        .sort((a, b) => a.dist - b.dist);
+}
+
+function evaluate(frames, people) {
+    const results = frames.map(f => rankPeople(f, people));
+    const bestName = results[0][0].name;
+
+    if (!results.every(r => r[0].name === bestName)) return { ok: false, reason: "Face matched inconsistently." };
+
+    const worstBest = Math.max(...results.map(r => r[0].dist));
+    if (worstBest >= MATCH_THRESHOLD) return { ok: false, reason: `Face not recognized (closest distance ${worstBest.toFixed(2)}).` };
+
+    if (people.length > 1) {
+        const margin = results.reduce((s, r) => s + (r[1].dist - r[0].dist), 0) / results.length;
+        if (margin < MIN_MARGIN) return { ok: false, reason: "Match too close to another person. Denied." };
+    }
+    return { ok: true, name: bestName };
+}
+
+/* =========================================================
+   REMOTE APP
+   ========================================================= */
+
+// Download only (does NOT run anything)
+async function fetchAppHtml() {
+    const res = await fetch(APP_URL + "?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("Could not load app (HTTP " + res.status + ")");
+    const html = await res.text();
+    if (!html.trim()) throw new Error("The app file is empty");
+    return html;
+}
+
+async function grantAccess(name, htmlPromise, note) {
+    lockScreen.classList.add('granted');
+    document.getElementById('lockIcon').innerText = '🔓';
+    document.getElementById('lockTitle').innerText = 'Access Granted';
+    statusDiv.innerText = note || `Welcome, ${name}.`;
+    statusDiv.style.color = '#00e676';
+    btnScan.style.display = 'none';
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+
+    try {
+        const html = await htmlPromise;
+        const loaded = new Promise(res => appFrame.addEventListener('load', res, { once: true }));
+        appFrame.srcdoc = html;
+        appFrame.style.display = "block";
+        await loaded;
+        lockScreen.style.opacity = '0';
+        setTimeout(() => lockScreen.style.display = 'none', 500);
+    } catch (err) {
+        statusDiv.innerText = "Access granted, but the app failed to load: " + err.message;
+        statusDiv.style.color = '#ffc107';
+    }
+}
+
+/* =========================================================
+   SCAN BUTTON
+   ========================================================= */
+
+btnScan.addEventListener('click', async () => {
+    btnScan.disabled = true;
+    try {
+        stage.classList.add('scanning');
+        statusDiv.style.color = '#aab3cf';
+        statusDiv.innerText = "Scanning... look directly into the lens.";
+
+        const rowsPromise = sb.from('allowed_faces').select('name, face_embedding');
+        const htmlPromise = fetchAppHtml();
+        htmlPromise.catch(() => {});
+
+        const frames = await collectFrames();
+        if (frames.length < FRAMES_REQUIRED) {
+            statusDiv.innerText = "Couldn't get a clear view. Face the camera in good light and try again.";
+            return;
+        }
+
+        statusDiv.innerText = "Verifying...";
+        const { data: rows, error } = await rowsPromise;
+        if (error) { statusDiv.innerText = "Database error: " + error.message; return; }
+        if (!rows || rows.length === 0) { statusDiv.innerText = "Access denied. No registered faces found."; return; }
+
+        const verdict = evaluate(frames, buildPeople(rows));
+        if (verdict.ok) {
+            saveNewSession(verdict.name); // remember this login for the next visits
+            await grantAccess(verdict.name, htmlPromise,
+                `Welcome, ${verdict.name}. Face scan skipped for your next ${REMEMBER_LOGINS} visits.`);
+        } else {
+            statusDiv.innerText = "Authentication failed. " + verdict.reason;
+            statusDiv.style.color = '#ffc107';
+            lockScreen.classList.add('denied');
+            setTimeout(() => lockScreen.classList.remove('denied'), 450);
+        }
+    } catch (err) {
+        statusDiv.innerText = "System error: " + err.message;
+        console.error(err);
+    } finally {
+        stage.classList.remove('scanning');
+        if (lockScreen.style.display !== 'none' && !lockScreen.classList.contains('granted')) btnScan.disabled = false;
+    }
+});
+
+/* =========================================================
+   STARTUP
+   ========================================================= */
+
+async function startup() {
+    const session = readSession();
+
+    // No valid remembered session -> normal face scan
+    if (!session) {
+        startScanFlow("Loading recognition models...");
+        return;
+    }
+
+    // Remembered session: skip models + camera and go straight to the app
+    try {
+        statusDiv.innerText = `Welcome back, ${session.name}...`;
+        const html = await fetchAppHtml();
+        const left = consumeRememberedLogin(session);
+        const note = left > 0
+            ? `Welcome back, ${session.name}. ${left} remembered login${left === 1 ? '' : 's'} left before the next face scan.`
+            : `Welcome back, ${session.name}. Next visit will need a face scan.`;
+        await grantAccess(session.name, Promise.resolve(html), note);
+    } catch (err) {
+        // Couldn't load the app: fall back to the normal lock screen, no login used up
+        console.warn("Remembered login failed:", err);
+        startScanFlow("Couldn't resume your session. Loading face scan...");
+    }
+}
+
+window.addEventListener('load', startup);
+</script>
+</body>
+</html>
